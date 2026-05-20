@@ -1,50 +1,48 @@
 import argparse
-import atexit
 import csv
-import ctypes
 import ipaddress
+import os
 import platform
+import queue
 import re
-import shutil
 import socket
 import struct
 import subprocess
 import threading
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import psutil
+import ctypes
 from ctypes import wintypes
 
 
 # =========================
-# Windows ICMP API (fast ping)
+# Windows ICMP API
 # =========================
-
 icmp = ctypes.WinDLL("icmp.dll")
-kernel32 = ctypes.WinDLL("kernel32.dll")
 
 icmp.IcmpCreateFile.restype = wintypes.HANDLE
 icmp.IcmpCloseHandle.argtypes = [wintypes.HANDLE]
 icmp.IcmpCloseHandle.restype = wintypes.BOOL
 
 icmp.IcmpSendEcho.argtypes = [
-    wintypes.HANDLE,      # IcmpHandle
-    wintypes.DWORD,       # DestinationAddress
-    wintypes.LPVOID,      # RequestData
-    wintypes.WORD,        # RequestSize
-    wintypes.LPVOID,      # RequestOptions
-    wintypes.LPVOID,      # ReplyBuffer
-    wintypes.DWORD,       # ReplySize
-    wintypes.DWORD,       # Timeout
+    wintypes.HANDLE,   # IcmpHandle
+    wintypes.DWORD,    # DestinationAddress
+    wintypes.LPVOID,   # RequestData
+    wintypes.WORD,     # RequestSize
+    wintypes.LPVOID,   # RequestOptions
+    wintypes.LPVOID,   # ReplyBuffer
+    wintypes.DWORD,    # ReplySize
+    wintypes.DWORD,    # Timeout
 ]
 icmp.IcmpSendEcho.restype = wintypes.DWORD
 
 _thread_local = threading.local()
 
 
-def _get_icmp_handle() -> wintypes.HANDLE:
+def _get_icmp_handle():
     h = getattr(_thread_local, "icmp_handle", None)
     if h:
         return h
@@ -53,23 +51,21 @@ def _get_icmp_handle() -> wintypes.HANDLE:
     return h
 
 
-def _close_thread_handle():
+def _close_icmp_handle():
     h = getattr(_thread_local, "icmp_handle", None)
     if h:
         try:
             icmp.IcmpCloseHandle(h)
         except Exception:
             pass
-
-
-atexit.register(_close_thread_handle)
+        _thread_local.icmp_handle = None
 
 
 def ip_to_dword(ip: str) -> int:
     return struct.unpack("!I", socket.inet_aton(ip))[0]
 
 
-def ping_icmp(ip: str, timeout_ms: int = 50) -> bool:
+def ping_icmp(ip: str, timeout_ms: int) -> bool:
     """
     Fast Windows ping using IcmpSendEcho.
     """
@@ -79,29 +75,27 @@ def ping_icmp(ip: str, timeout_ms: int = 50) -> bool:
             return False
 
         payload = b"py"
-        send_buf = ctypes.create_string_buffer(payload)
-        reply_size = ctypes.sizeof(ICMP_ECHO_REPLY) + 32
-        reply_buf = ctypes.create_string_buffer(reply_size)
+        request = ctypes.create_string_buffer(payload)
+        reply = ctypes.create_string_buffer(1024)
 
-        result = icmp.IcmpSendEcho(
+        ret = icmp.IcmpSendEcho(
             handle,
             ip_to_dword(ip),
-            send_buf,
+            request,
             len(payload),
             None,
-            reply_buf,
-            reply_size,
+            reply,
+            len(reply),
             timeout_ms,
         )
-        return result > 0
+        return ret > 0
     except Exception:
         return False
 
 
 # =========================
-# Data models
+# Models
 # =========================
-
 @dataclass(frozen=True)
 class Device:
     ip: str
@@ -117,26 +111,9 @@ class NetSource:
     iface: str = ""
 
 
-class ICMP_ECHO_REPLY(ctypes.Structure):
-    _fields_ = [
-        ("Address", wintypes.DWORD),
-        ("Status", wintypes.DWORD),
-        ("RoundTripTime", wintypes.DWORD),
-        ("DataSize", wintypes.WORD),
-        ("Reserved", wintypes.WORD),
-        ("Data", wintypes.LPVOID),
-        ("Options", wintypes.DWORD * 4),  # padding for practical use
-    ]
-
-
 # =========================
-# Utility
+# Helpers
 # =========================
-
-def which(cmd: str) -> bool:
-    return shutil.which(cmd) is not None
-
-
 def run_cmd(cmd: List[str], timeout: int = 15) -> Tuple[int, str]:
     try:
         creationflags = subprocess.CREATE_NO_WINDOW if platform.system().lower() == "windows" else 0
@@ -167,10 +144,14 @@ def sort_ip(ip: str):
         return ip
 
 
-# =========================
-# Windows network discovery
-# =========================
+def which(cmd: str) -> bool:
+    import shutil
+    return shutil.which(cmd) is not None
 
+
+# =========================
+# Windows discovery
+# =========================
 def local_interfaces() -> List[NetSource]:
     out: List[NetSource] = []
     seen: Set[str] = set()
@@ -179,6 +160,7 @@ def local_interfaces() -> List[NetSource]:
         for a in addrs:
             if a.family != socket.AF_INET:
                 continue
+
             ip = a.address
             if ip.startswith("127."):
                 continue
@@ -193,10 +175,11 @@ def local_interfaces() -> List[NetSource]:
             if key not in seen:
                 seen.add(key)
                 out.append(NetSource(net, "nic", if_name))
+
     return out
 
 
-def routes_windows() -> List[NetSource]:
+def windows_routes() -> List[NetSource]:
     code, text = run_cmd(["route", "print", "-4"], timeout=10)
     if code != 0:
         return []
@@ -236,16 +219,16 @@ def routes_windows() -> List[NetSource]:
         if key not in seen:
             seen.add(key)
             nets.append(NetSource(net, "route"))
+
     return nets
 
 
-def arp_cache_windows() -> Dict[str, str]:
+def windows_arp_cache() -> Dict[str, str]:
     out: Dict[str, str] = {}
 
     code, text = run_cmd(["arp", "-a"], timeout=6)
     if code == 0:
         for line in text.splitlines():
-            line = line.strip()
             parts = line.split()
             if len(parts) >= 2 and is_ipv4(parts[0]):
                 out[parts[0]] = parts[1].replace("-", ":").lower()
@@ -270,175 +253,100 @@ def reverse_dns(ip: str) -> str:
 
 
 # =========================
-# Optional tools
+# Threaded scanner
 # =========================
-
-def nmap_scan(cidr: str) -> Dict[str, str]:
-    if not which("nmap"):
-        return {}
-
-    # Fast host discovery only.
-    code, text = run_cmd(["nmap", "-sn", "-n", "-T5", "--max-retries", "1", cidr], timeout=300)
-    if code not in (0, 1):
-        return {}
-
-    out: Dict[str, str] = {}
-    current_ip = ""
-
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("Nmap scan report for "):
-            tail = line[len("Nmap scan report for "):].strip()
-            if tail.endswith(")") and "(" in tail:
-                current_ip = tail.split("(")[-1].rstrip(")")
-            else:
-                current_ip = tail if is_ipv4(tail) else ""
-        elif line.lower().startswith("mac address:") and current_ip:
-            mac = line.split(":", 1)[1].split()[0].lower()
-            out[current_ip] = mac
-
-    return out
+def ping_worker(ip_q: "queue.Queue[Optional[str]]", result_q: "queue.Queue[str]", timeout_ms: int):
+    try:
+        while True:
+            ip = ip_q.get()
+            try:
+                if ip is None:
+                    return
+                if ping_icmp(ip, timeout_ms):
+                    result_q.put(ip)
+            finally:
+                ip_q.task_done()
+    finally:
+        _close_icmp_handle()
 
 
-# =========================
-# Scanner
-# =========================
-
-def merge_device(devices: Dict[str, Device], ip: str, mac: str = "", hostname: str = "", source: str = "") -> None:
+def merge_device(devices: Dict[str, Device], ip: str, mac: str = "", hostname: str = "", source: str = ""):
     if not is_ipv4(ip):
         return
-    existing = devices.get(ip)
-    if existing is None:
+
+    old = devices.get(ip)
+    if old is None:
         devices[ip] = Device(ip=ip, mac=mac, hostname=hostname, sources=source)
         return
 
-    sources = set(filter(None, [existing.sources, source]))
+    sources = set(filter(None, [old.sources, source]))
     devices[ip] = Device(
         ip=ip,
-        mac=mac or existing.mac,
-        hostname=hostname or existing.hostname,
+        mac=mac or old.mac,
+        hostname=hostname or old.hostname,
         sources=";".join(sorted(sources)),
     )
 
 
-def iter_hosts(cidr: ipaddress.IPv4Network):
-    for ip in cidr.hosts():
-        yield str(ip)
-
-
-def scan_cidr_icmp(
+def scan_cidr_threaded(
     cidr: ipaddress.IPv4Network,
     workers: int,
     timeout_ms: int,
-    max_in_flight: int,
-) -> List[str]:
-    live: List[str] = []
-
-    host_iter = iter_hosts(cidr)
-    pending = set()
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        # Prime the queue.
-        for _ in range(max_in_flight):
-            try:
-                ip = next(host_iter)
-            except StopIteration:
-                break
-            pending.add(ex.submit(ping_icmp, ip, timeout_ms))
-
-        while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for fut in done:
-                try:
-                    if fut.result():
-                        # We do not know which IP from the future directly;
-                        # so use a closure-free approach below in scan_cidr().
-                        pass
-                except Exception:
-                    pass
-
-            # Refill
-            for _ in range(len(done)):
-                try:
-                    ip = next(host_iter)
-                except StopIteration:
-                    break
-                pending.add(ex.submit(ping_icmp, ip, timeout_ms))
-
-    return live
-
-
-def scan_cidr(
-    cidr: ipaddress.IPv4Network,
-    workers: int = 1024,
-    timeout_ms: int = 30,
-    max_in_flight: int = 4096,
-    use_nmap: bool = True,
-    hostname_resolution: bool = True,
+    queue_size: int,
+    use_dns: bool,
 ) -> List[Device]:
     devices: Dict[str, Device] = {}
 
-    # Seed with current Windows caches.
-    for ip, mac in arp_cache_windows().items():
+    # Seed from Windows cache before and after scan
+    for ip, mac in windows_arp_cache().items():
         merge_device(devices, ip, mac=mac, source="arp-cache")
 
-    # Nmap first if installed, because it may find MACs on local segments quickly.
-    if use_nmap and which("nmap"):
+    ip_q: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=queue_size)
+    result_q: "queue.Queue[str]" = queue.Queue()
+
+    threads = []
+    for _ in range(workers):
+        t = threading.Thread(target=ping_worker, args=(ip_q, result_q, timeout_ms), daemon=True)
+        t.start()
+        threads.append(t)
+
+    # Producer: stream IPs into the queue without loading the whole subnet into memory.
+    def producer():
+        for ip in cidr.hosts():
+            ip_q.put(str(ip))
+        for _ in range(workers):
+            ip_q.put(None)
+
+    prod = threading.Thread(target=producer, daemon=True)
+    prod.start()
+
+    # Wait for all tasks to finish.
+    ip_q.join()
+    prod.join()
+
+    # Drain results.
+    live_ips = []
+    while True:
         try:
-            found = nmap_scan(str(cidr))
-            for ip, mac in found.items():
-                merge_device(devices, ip, mac=mac, source="nmap")
-        except Exception:
-            pass
+            live_ips.append(result_q.get_nowait())
+        except queue.Empty:
+            break
 
-    # High-speed ICMP sweep.
-    host_iter = iter_hosts(cidr)
-    pending = {}
-    live_ips: List[str] = []
+    for ip in live_ips:
+        merge_device(devices, ip, source="icmp")
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        def submit_next():
-            try:
-                ip = next(host_iter)
-            except StopIteration:
-                return False
-            fut = ex.submit(ping_icmp, ip, timeout_ms)
-            pending[fut] = ip
-            return True
-
-        for _ in range(max_in_flight):
-            if not submit_next():
-                break
-
-        while pending:
-            done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
-            for fut in done:
-                ip = pending.pop(fut, None)
-                if ip is None:
-                    continue
-                try:
-                    if fut.result():
-                        live_ips.append(ip)
-                        merge_device(devices, ip, source="icmp")
-                except Exception:
-                    pass
-            while len(pending) < max_in_flight:
-                if not submit_next():
-                    break
-
-    # Refresh Windows neighbor cache after pinging; often this fills in MACs.
-    cache = arp_cache_windows()
+    # Refresh cache after the sweep to pick up MACs for active neighbors.
+    cache = windows_arp_cache()
     for ip, mac in cache.items():
         if ip in devices:
             d = devices[ip]
             devices[ip] = Device(ip=d.ip, mac=mac or d.mac, hostname=d.hostname, sources=d.sources)
 
-    # DNS in parallel
-    if hostname_resolution and devices:
-        ips = list(devices.keys())
+    # Reverse DNS in parallel
+    if use_dns and devices:
         with ThreadPoolExecutor(max_workers=min(256, workers)) as ex:
-            futs = {ex.submit(reverse_dns, ip): ip for ip in ips}
-            for fut in futs:
+            futs = {ex.submit(reverse_dns, ip): ip for ip in devices.keys()}
+            for fut in as_completed(futs):
                 ip = futs[fut]
                 try:
                     host = fut.result()
@@ -451,44 +359,7 @@ def scan_cidr(
     return sorted(devices.values(), key=lambda d: sort_ip(d.ip))
 
 
-def scan_auto(
-    workers: int,
-    timeout_ms: int,
-    max_in_flight: int,
-    use_nmap: bool,
-    hostname_resolution: bool,
-) -> List[Device]:
-    devices: Dict[str, Device] = {}
-
-    for ns in local_interfaces():
-        merge_device(devices, ns.network.network_address.exploded, source=f"nic:{ns.iface}")
-
-    # Scan local NIC routes automatically.
-    targets = []
-    seen: Set[str] = set()
-    for ns in local_interfaces() + routes_windows():
-        key = str(ns.network)
-        if key not in seen and ns.network.prefixlen != 0:
-            seen.add(key)
-            targets.append(ns.network)
-
-    for net in targets:
-        print(f"Scanning {net}")
-        found = scan_cidr(
-            net,
-            workers=workers,
-            timeout_ms=timeout_ms,
-            max_in_flight=max_in_flight,
-            use_nmap=use_nmap,
-            hostname_resolution=hostname_resolution,
-        )
-        for d in found:
-            merge_device(devices, d.ip, mac=d.mac, hostname=d.hostname, source=d.sources)
-
-    return sorted(devices.values(), key=lambda d: sort_ip(d.ip))
-
-
-def save_csv(devices: List[Device], filename: str) -> None:
+def save_csv(devices: List[Device], filename: str):
     with open(filename, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(["IP Address", "MAC Address", "Hostname", "Sources"])
@@ -496,43 +367,67 @@ def save_csv(devices: List[Device], filename: str) -> None:
             w.writerow([d.ip, d.mac, d.hostname, d.sources])
 
 
+def auto_targets() -> List[ipaddress.IPv4Network]:
+    nets: List[ipaddress.IPv4Network] = []
+    seen: Set[str] = set()
+
+    for ns in local_interfaces() + windows_routes():
+        key = str(ns.network)
+        if key not in seen and ns.network.prefixlen != 0:
+            seen.add(key)
+            nets.append(ns.network)
+
+    return nets
+
+
 def main():
     if platform.system().lower() != "windows":
-        raise SystemExit("This version is Windows-only.")
+        raise SystemExit("Windows only.")
 
-    p = argparse.ArgumentParser(description="Fast Windows IP scanner using ICMP API.")
+    p = argparse.ArgumentParser(description="High-performance Windows threaded IP scanner.")
     p.add_argument("--cidr", default="", help="CIDR to scan, e.g. 8.0.0.0/8")
-    p.add_argument("--workers", type=int, default=1024, help="Thread count")
-    p.add_argument("--timeout-ms", type=int, default=25, help="ICMP timeout per host")
-    p.add_argument("--max-in-flight", type=int, default=4096, help="Maximum queued tasks")
-    p.add_argument("--no-nmap", action="store_true", help="Disable nmap if installed")
-    p.add_argument("--no-dns", action="store_true", help="Disable reverse DNS lookups")
+    p.add_argument("--workers", type=int, default=1024, help="Number of worker threads")
+    p.add_argument("--timeout-ms", type=int, default=20, help="ICMP timeout per host")
+    p.add_argument("--queue-size", type=int, default=65536, help="Bounded queue size")
+    p.add_argument("--no-dns", action="store_true", help="Disable reverse DNS")
     p.add_argument("--out", default="devices.csv", help="CSV output file")
     args = p.parse_args()
 
     print(f"Platform: {platform.system()} {platform.release()}")
-    print(f"nmap: {'yes' if which('nmap') else 'no'}")
     print(f"Workers: {args.workers}")
     print(f"Timeout: {args.timeout_ms} ms")
+    print(f"Queue size: {args.queue_size}")
+    print(f"nmap installed: {'yes' if which('nmap') else 'no'}")
 
     if args.cidr:
         cidr = ipaddress.IPv4Network(args.cidr, strict=False)
-        devices = scan_cidr(
-            cidr,
-            workers=args.workers,
-            timeout_ms=args.timeout_ms,
-            max_in_flight=args.max_in_flight,
-            use_nmap=not args.no_nmap,
-            hostname_resolution=not args.no_dns,
-        )
+        targets = [cidr]
     else:
-        devices = scan_auto(
+        targets = auto_targets()
+
+    if not targets:
+        print("No targets found.")
+        return
+
+    print("\nTargets:")
+    for t in targets:
+        print(f"  {t}")
+
+    all_devices: Dict[str, Device] = {}
+
+    for target in targets:
+        print(f"\nScanning {target} ...")
+        found = scan_cidr_threaded(
+            target,
             workers=args.workers,
             timeout_ms=args.timeout_ms,
-            max_in_flight=args.max_in_flight,
-            use_nmap=not args.no_nmap,
-            hostname_resolution=not args.no_dns,
+            queue_size=args.queue_size,
+            use_dns=not args.no_dns,
         )
+        for d in found:
+            merge_device(all_devices, d.ip, mac=d.mac, hostname=d.hostname, source=d.sources)
+
+    devices = sorted(all_devices.values(), key=lambda d: sort_ip(d.ip))
 
     print("\nDevices found:")
     for d in devices:
