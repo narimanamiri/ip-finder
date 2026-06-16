@@ -88,7 +88,14 @@ def ping_icmp(ip: str, timeout_ms: int) -> bool:
             len(reply),
             timeout_ms,
         )
-        return ret > 0
+        if ret <= 0:
+            return False
+        # IcmpSendEcho also returns a reply for error responses (e.g. a router's
+        # "destination unreachable"), which would be a false positive. The
+        # ICMP_ECHO_REPLY struct stores its Status DWORD at offset 4; only
+        # IP_SUCCESS (0) means the target host itself answered.
+        status = struct.unpack_from("<I", reply.raw, 4)[0]
+        return status == 0
     except Exception:
         return False
 

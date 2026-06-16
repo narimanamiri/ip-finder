@@ -1,13 +1,12 @@
 import argparse
 import ipaddress
+import os
 import socket
 import subprocess
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
-import os
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
+from itertools import islice
 
 # For maximum speed on large ranges, consider using masscan/zmap externally.
 # This script maximizes Python resources with high concurrency + low timeouts.
@@ -18,9 +17,9 @@ def is_alive_ping(ip, timeout=1):
         # -c 1 on Linux, -n 1 on Windows
         param = '-n' if os.name == 'nt' else '-c'
         command = ['ping', param, '1', '-w', str(int(timeout*1000)), str(ip)]
-        output = subprocess.check_output(command, stderr=subprocess.STDOUT, timeout=timeout+1)
+        subprocess.check_output(command, stderr=subprocess.STDOUT, timeout=timeout+1)
         return True
-    except:
+    except (subprocess.SubprocessError, OSError):
         return False
 
 
@@ -30,11 +29,11 @@ def is_alive_tcp(ip, port=80, timeout=0.8):
     sock.settimeout(timeout)
     try:
         result = sock.connect_ex((str(ip), port))
-        sock.close()
         return result == 0
-    except:
-        sock.close()
+    except OSError:
         return False
+    finally:
+        sock.close()
 
 
 def scan_ip(ip, methods=['ping', 'tcp'], ports=[80, 443]):
@@ -79,6 +78,7 @@ def main():
     parser.add_argument("--ports", type=str, default="80,443,22,445", help="Ports for TCP check (comma separated)")
     parser.add_argument("--method", choices=['ping', 'tcp', 'both'], default='both', help="Discovery method")
     parser.add_argument("--full-port-scan", action="store_true", help="Do full port scan on live hosts (slower)")
+    parser.add_argument("--json", action="store_true", help="Write the output file as JSON")
     args = parser.parse_args()
 
     methods = ['ping', 'tcp'] if args.method == 'both' else [args.method]
@@ -91,23 +91,34 @@ def main():
     start_time = time.time()
     scanned = 0
 
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        futures = {}
-        
-        for ip in generate_ips(args.cidr):
-            future = executor.submit(scan_ip, ip, methods, tcp_ports)
-            futures[future] = ip
-            scanned += 1
-            
-            # Progress every 10k
-            if scanned % 10000 == 0:
-                print(f"Queued {scanned} IPs...")
+    # Bound the number of in-flight futures so scanning a huge range (e.g. /8)
+    # does not buffer millions of pending tasks in memory at once.
+    ip_gen = generate_ips(args.cidr)
+    window = max(args.threads * 2, args.threads + 1)
 
-        for future in as_completed(futures):
-            ip_str, is_live, open_p = future.result()
-            if is_live:
-                live_hosts.append((ip_str, open_p))
-                print(f"[+] LIVE: {ip_str} | Open ports: {open_p}")
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        in_flight = {
+            executor.submit(scan_ip, ip, methods, tcp_ports): ip
+            for ip in islice(ip_gen, window)
+        }
+        scanned += len(in_flight)
+
+        while in_flight:
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in done:
+                in_flight.pop(future)
+                ip_str, is_live, open_p = future.result()
+                if is_live:
+                    live_hosts.append((ip_str, open_p))
+                    print(f"[+] LIVE: {ip_str} | Open ports: {open_p}")
+
+                # Refill the window with the next IP, if any remain.
+                next_ip = next(ip_gen, None)
+                if next_ip is not None:
+                    in_flight[executor.submit(scan_ip, next_ip, methods, tcp_ports)] = next_ip
+                    scanned += 1
+                    if scanned % 10000 == 0:
+                        print(f"Scanned {scanned} IPs...")
 
     elapsed = time.time() - start_time
     print(f"\nScan completed in {elapsed:.2f} seconds.")
@@ -115,8 +126,15 @@ def main():
 
     if args.output and live_hosts:
         with open(args.output, 'w') as f:
-            for ip, ports in live_hosts:
-                f.write(f"{ip} | ports: {ports}\n")
+            if args.json:
+                import json
+                json.dump(
+                    [{"ip": ip, "open_ports": ports} for ip, ports in live_hosts],
+                    f, indent=2,
+                )
+            else:
+                for ip, ports in live_hosts:
+                    f.write(f"{ip} | ports: {ports}\n")
         print(f"Results saved to {args.output}")
 
 
