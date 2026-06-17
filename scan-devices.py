@@ -18,6 +18,12 @@ try:
 except Exception:
     SCAPY_AVAILABLE = False
 
+try:
+    from oui_lookup import annotate as oui_annotate
+except Exception:
+    def oui_annotate(_mac: str) -> str:
+        return ""
+
 
 @dataclass(frozen=True)
 class Device:
@@ -25,6 +31,10 @@ class Device:
     mac: str = ""
     hostname: str = ""
     source: str = ""
+
+    @property
+    def vendor(self) -> str:
+        return oui_annotate(self.mac)
 
 
 @dataclass(frozen=True)
@@ -497,9 +507,9 @@ def discover_devices(
 def save_csv(devices: List[Device], filename: str = "devices.csv") -> None:
     with open(filename, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["IP Address", "MAC Address", "Hostname", "Source"])
+        w.writerow(["IP Address", "MAC Address", "Vendor", "Hostname", "Source"])
         for d in devices:
-            w.writerow([d.ip, d.mac, d.hostname, d.source])
+            w.writerow([d.ip, d.mac, d.vendor, d.hostname, d.source])
 
 
 def main():
@@ -531,7 +541,7 @@ def main():
     print("\nDevices found:")
     for d in devices:
         host = f"  {d.hostname}" if d.hostname else ""
-        print(f"  {d.ip:<15} {d.mac:<18} {host}")
+        print(f"  {d.ip:<15} {d.mac:<18} {d.vendor:<16}{host}")
 
     save_csv(devices, args.out)
     print(f"\nSaved to {args.out}")

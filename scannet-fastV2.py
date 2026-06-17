@@ -69,6 +69,34 @@ def generate_ips(cidr):
         return
 
 
+def reverse_dns(ip, timeout=0.5):
+    """Best-effort reverse-DNS lookup for a discovered IP (stdlib, opt-in)."""
+    try:
+        socket.setdefaulttimeout(timeout)
+        host, _, _ = socket.gethostbyaddr(str(ip))
+        return host
+    except OSError:
+        return ""
+
+
+def resolve_hostnames(ips, workers=64):
+    """Resolve reverse-DNS names for a list of IPs concurrently."""
+    names = {}
+    if not ips:
+        return names
+    with ThreadPoolExecutor(max_workers=min(workers, len(ips))) as ex:
+        futs = {ex.submit(reverse_dns, ip): ip for ip in ips}
+        for fut in futs:
+            ip = futs[fut]
+            try:
+                host = fut.result()
+                if host:
+                    names[ip] = host
+            except Exception:
+                pass
+    return names
+
+
 def main():
     parser = argparse.ArgumentParser(description="High-performance multi-threaded IP Scanner for large CIDRs")
     parser.add_argument("cidr", help="CIDR range to scan, e.g. 192.168.1.0/24 or 10.0.0.0/8")
@@ -79,6 +107,7 @@ def main():
     parser.add_argument("--method", choices=['ping', 'tcp', 'both'], default='both', help="Discovery method")
     parser.add_argument("--full-port-scan", action="store_true", help="Do full port scan on live hosts (slower)")
     parser.add_argument("--json", action="store_true", help="Write the output file as JSON")
+    parser.add_argument("--resolve", action="store_true", help="Reverse-DNS resolve live hosts (stdlib, no extra deps)")
     args = parser.parse_args()
 
     methods = ['ping', 'tcp'] if args.method == 'both' else [args.method]
@@ -124,17 +153,28 @@ def main():
     print(f"\nScan completed in {elapsed:.2f} seconds.")
     print(f"Scanned: {scanned} | Live hosts: {len(live_hosts)}")
 
+    # Optional reverse-DNS enrichment of the live hosts.
+    hostnames = {}
+    if args.resolve and live_hosts:
+        print("Resolving hostnames...")
+        hostnames = resolve_hostnames([ip for ip, _ in live_hosts])
+        for ip, _ in live_hosts:
+            if ip in hostnames:
+                print(f"    {ip} -> {hostnames[ip]}")
+
     if args.output and live_hosts:
         with open(args.output, 'w') as f:
             if args.json:
                 import json
                 json.dump(
-                    [{"ip": ip, "open_ports": ports} for ip, ports in live_hosts],
+                    [{"ip": ip, "hostname": hostnames.get(ip, ""), "open_ports": ports}
+                     for ip, ports in live_hosts],
                     f, indent=2,
                 )
             else:
                 for ip, ports in live_hosts:
-                    f.write(f"{ip} | ports: {ports}\n")
+                    name = f" | host: {hostnames[ip]}" if ip in hostnames else ""
+                    f.write(f"{ip} | ports: {ports}{name}\n")
         print(f"Results saved to {args.output}")
 
 

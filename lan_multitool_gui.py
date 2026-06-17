@@ -15,6 +15,7 @@ Run:
 
 import csv
 import ipaddress
+import json
 import os
 import platform
 import queue
@@ -23,10 +24,17 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Set, Tuple
+
+try:
+    from oui_lookup import annotate as oui_annotate
+except Exception:
+    def oui_annotate(_mac: str) -> str:  # graceful fallback if module missing
+        return ""
 
 try:
     import psutil
@@ -49,7 +57,9 @@ class Device:
     ip: str
     mac: str = ""
     hostname: str = ""
+    vendor: str = ""
     sources: str = ""
+    open_ports: str = ""
     first_seen: float = 0.0
     last_seen: float = 0.0
     alive: bool = True
@@ -112,6 +122,72 @@ def reverse_dns(ip: str) -> str:
         return host
     except Exception:
         return ""
+
+
+# Common service ports probed by the optional TCP port-scan feature.
+COMMON_PORTS: List[int] = [
+    21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 554,
+    1723, 3306, 3389, 5900, 8080, 8443, 8888,
+]
+
+
+def tcp_probe(ip: str, port: int, timeout: float = 0.6) -> bool:
+    """Return True if a TCP connect to ip:port succeeds. Pure stdlib."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((ip, port)) == 0
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def scan_ports(ip: str, ports: List[int], timeout: float = 0.6, workers: int = 32) -> List[int]:
+    """Probe a list of ports on one host concurrently; return sorted open ports."""
+    open_ports: List[int] = []
+    if not ports:
+        return open_ports
+    with ThreadPoolExecutor(max_workers=min(workers, len(ports))) as ex:
+        futs = {ex.submit(tcp_probe, ip, p, timeout): p for p in ports}
+        for fut in as_completed(futs):
+            p = futs[fut]
+            try:
+                if fut.result():
+                    open_ports.append(p)
+            except Exception:
+                pass
+    return sorted(open_ports)
+
+
+def parse_ports(spec: str) -> List[int]:
+    """Parse a port spec like '22,80,443,8000-8010' into a sorted unique list."""
+    out: Set[int] = set()
+    for chunk in (spec or "").replace(" ", "").split(","):
+        if not chunk:
+            continue
+        if "-" in chunk:
+            try:
+                lo, hi = chunk.split("-", 1)
+                lo_i, hi_i = int(lo), int(hi)
+                if lo_i > hi_i:
+                    lo_i, hi_i = hi_i, lo_i
+                for p in range(lo_i, hi_i + 1):
+                    if 0 < p < 65536:
+                        out.add(p)
+            except ValueError:
+                continue
+        else:
+            try:
+                p = int(chunk)
+                if 0 < p < 65536:
+                    out.add(p)
+            except ValueError:
+                continue
+    return sorted(out)
 
 
 def ping_one(ip: str) -> bool:
@@ -408,7 +484,8 @@ class DeviceStore:
         self.lock = threading.Lock()
         self.devices: Dict[str, Device] = {}
 
-    def upsert(self, ip: str, mac: str = "", hostname: str = "", source: str = "") -> Tuple[bool, bool]:
+    def upsert(self, ip: str, mac: str = "", hostname: str = "", source: str = "",
+               open_ports: str = "") -> Tuple[bool, bool]:
         """
         Returns (created, changed)
         """
@@ -424,7 +501,9 @@ class DeviceStore:
                     ip=ip,
                     mac=mac,
                     hostname=hostname,
+                    vendor=oui_annotate(mac),
                     sources=source,
+                    open_ports=open_ports,
                     first_seen=now,
                     last_seen=now,
                     alive=True,
@@ -435,15 +514,22 @@ class DeviceStore:
             sources = set(filter(None, [existing.sources, source]))
             new_mac = mac or existing.mac
             new_host = hostname or existing.hostname
+            new_vendor = oui_annotate(new_mac) or existing.vendor
+            new_ports = open_ports or existing.open_ports
 
-            if new_mac != existing.mac or new_host != existing.hostname or ";".join(sorted(sources)) != existing.sources:
+            if (new_mac != existing.mac or new_host != existing.hostname
+                    or ";".join(sorted(sources)) != existing.sources
+                    or new_ports != existing.open_ports
+                    or new_vendor != existing.vendor):
                 changed = True
 
             self.devices[ip] = Device(
                 ip=ip,
                 mac=new_mac,
                 hostname=new_host,
+                vendor=new_vendor,
                 sources=";".join(sorted(sources)),
+                open_ports=new_ports,
                 first_seen=existing.first_seen or now,
                 last_seen=now,
                 alive=True,
@@ -457,7 +543,9 @@ class DeviceStore:
                     ip=dev.ip,
                     mac=dev.mac,
                     hostname=dev.hostname,
+                    vendor=dev.vendor,
                     sources=dev.sources,
+                    open_ports=dev.open_ports,
                     first_seen=dev.first_seen,
                     last_seen=dev.last_seen,
                     alive=False,
@@ -503,9 +591,17 @@ class App(tk.Tk):
         self.use_scapy = tk.BooleanVar(value=SCAPY_AVAILABLE)
         self.use_ping = tk.BooleanVar(value=True)
         self.use_reverse_dns = tk.BooleanVar(value=True)
+        self.use_port_scan = tk.BooleanVar(value=False)
+        self.monitor_on = tk.BooleanVar(value=False)
+        self.port_spec = tk.StringVar(value=",".join(str(p) for p in COMMON_PORTS))
         self.scan_interval = tk.IntVar(value=20)
         self.max_networks = tk.IntVar(value=256)
         self.max_ping_hosts = tk.IntVar(value=1024)
+
+        # Continuous-monitor change tracking: IPs known to be live as of the
+        # previous completed scan, used to flag NEW / GONE / BACK hosts.
+        self.known_alive: Set[str] = set()
+        self.first_monitor_pass = True
 
         self._build_ui()
         self._load_targets()
@@ -526,6 +622,7 @@ class App(tk.Tk):
         ttk.Button(controls, text="Start Passive", command=self.start_passive).pack(side="left", padx=4)
         ttk.Button(controls, text="Stop", command=self.stop_all).pack(side="left", padx=4)
         ttk.Button(controls, text="Export CSV", command=self.export_csv).pack(side="left", padx=4)
+        ttk.Button(controls, text="Export JSON", command=self.export_json).pack(side="left", padx=4)
         ttk.Button(controls, text="Clear", command=self.clear_devices).pack(side="left", padx=4)
 
         opts = ttk.Frame(top)
@@ -546,6 +643,11 @@ class App(tk.Tk):
         ttk.Label(opts, text="Max ping hosts/net").grid(row=1, column=3, sticky="e", pady=(6, 0))
         ttk.Entry(opts, textvariable=self.max_ping_hosts, width=8).grid(row=1, column=4, sticky="w", padx=6, pady=(6, 0))
 
+        ttk.Checkbutton(opts, text="TCP port probe", variable=self.use_port_scan).grid(row=2, column=0, sticky="w", padx=6, pady=(6, 0))
+        ttk.Label(opts, text="Ports").grid(row=2, column=1, sticky="e", pady=(6, 0))
+        ttk.Entry(opts, textvariable=self.port_spec, width=40).grid(row=2, column=2, columnspan=3, sticky="w", padx=6, pady=(6, 0))
+        ttk.Checkbutton(opts, text="Monitor mode (flag new/gone hosts)", variable=self.monitor_on, command=self._on_monitor_toggle).grid(row=2, column=5, columnspan=2, sticky="w", padx=12, pady=(6, 0))
+
         info = ttk.Frame(self, padding=(10, 0, 10, 8))
         info.pack(fill="x")
         ttk.Label(info, textvariable=self.status_text).pack(side="left")
@@ -554,32 +656,65 @@ class App(tk.Tk):
         body = ttk.Frame(self, padding=10)
         body.pack(fill="both", expand=True)
 
-        columns = ("ip", "mac", "hostname", "sources", "last_seen", "alive")
-        self.tree = ttk.Treeview(body, columns=columns, show="headings", height=20)
+        columns = ("ip", "mac", "vendor", "hostname", "ports", "sources", "last_seen", "alive")
+        self.tree = ttk.Treeview(body, columns=columns, show="headings", height=18)
         self.tree.heading("ip", text="IP")
         self.tree.heading("mac", text="MAC")
+        self.tree.heading("vendor", text="Vendor")
         self.tree.heading("hostname", text="Hostname")
+        self.tree.heading("ports", text="Open Ports")
         self.tree.heading("sources", text="Sources")
         self.tree.heading("last_seen", text="Last seen")
         self.tree.heading("alive", text="Alive")
 
-        self.tree.column("ip", width=130, anchor="w")
-        self.tree.column("mac", width=170, anchor="w")
-        self.tree.column("hostname", width=260, anchor="w")
-        self.tree.column("sources", width=260, anchor="w")
-        self.tree.column("last_seen", width=140, anchor="w")
-        self.tree.column("alive", width=70, anchor="center")
+        self.tree.column("ip", width=120, anchor="w")
+        self.tree.column("mac", width=150, anchor="w")
+        self.tree.column("vendor", width=130, anchor="w")
+        self.tree.column("hostname", width=210, anchor="w")
+        self.tree.column("ports", width=130, anchor="w")
+        self.tree.column("sources", width=200, anchor="w")
+        self.tree.column("last_seen", width=100, anchor="w")
+        self.tree.column("alive", width=60, anchor="center")
 
         yscroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=yscroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
         yscroll.pack(side="right", fill="y")
 
+        # Event log for continuous-monitor mode (NEW / GONE host notifications).
+        logframe = ttk.LabelFrame(self, text="Monitor events", padding=(8, 4, 8, 4))
+        logframe.pack(fill="x", padx=10, pady=(0, 4))
+        self.event_log = tk.Text(logframe, height=6, wrap="none", state="disabled")
+        log_scroll = ttk.Scrollbar(logframe, orient="vertical", command=self.event_log.yview)
+        self.event_log.configure(yscrollcommand=log_scroll.set)
+        self.event_log.pack(side="left", fill="both", expand=True)
+        log_scroll.pack(side="right", fill="y")
+
         bottom = ttk.Frame(self, padding=(10, 0, 10, 10))
         bottom.pack(fill="x")
         ttk.Button(bottom, text="Re-resolve DNS for visible", command=self.resolve_dns_for_all).pack(side="left")
+        ttk.Button(bottom, text="Clear events", command=self._clear_events).pack(side="left", padx=8)
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _on_monitor_toggle(self):
+        # Reset the baseline so the next scan establishes a fresh reference set.
+        self.first_monitor_pass = True
+        self.known_alive = set()
+        if self.monitor_on.get():
+            self._append_event("monitor enabled -- next scan sets the baseline")
+
+    def _append_event(self, text: str):
+        stamp = time.strftime("%H:%M:%S")
+        self.event_log.configure(state="normal")
+        self.event_log.insert("end", f"[{stamp}] {text}\n")
+        self.event_log.see("end")
+        self.event_log.configure(state="disabled")
+
+    def _clear_events(self):
+        self.event_log.configure(state="normal")
+        self.event_log.delete("1.0", "end")
+        self.event_log.configure(state="disabled")
 
     def _load_targets(self):
         self.local_nets = candidate_networks(
@@ -600,12 +735,16 @@ class App(tk.Tk):
             while True:
                 kind, payload = self.queue.get_nowait()
                 if kind == "device":
-                    ip, mac, hostname, source = payload
-                    created, changed = self.store.upsert(ip, mac=mac, hostname=hostname, source=source)
+                    ip, mac, hostname, source, open_ports = payload
+                    created, changed = self.store.upsert(
+                        ip, mac=mac, hostname=hostname, source=source, open_ports=open_ports
+                    )
                     if created or changed:
                         self._refresh_tree()
                 elif kind == "log":
                     self.last_scan_text.set(str(payload))
+                elif kind == "event":
+                    self._append_event(str(payload))
                 elif kind == "refresh":
                     self._refresh_tree()
                 elif kind == "status":
@@ -629,7 +768,9 @@ class App(tk.Tk):
                         ip=dev.ip,
                         mac=dev.mac,
                         hostname=dev.hostname,
+                        vendor=dev.vendor,
                         sources=dev.sources,
+                        open_ports=dev.open_ports,
                         first_seen=dev.first_seen,
                         last_seen=dev.last_seen,
                         alive=alive,
@@ -656,7 +797,8 @@ class App(tk.Tk):
             self.tree.insert(
                 "",
                 "end",
-                values=(d.ip, d.mac, d.hostname, d.sources, last_seen, "yes" if d.alive else "stale"),
+                values=(d.ip, d.mac, d.vendor, d.hostname, d.open_ports, d.sources,
+                        last_seen, "yes" if d.alive else "stale"),
             )
 
     def clear_devices(self):
@@ -685,10 +827,14 @@ class App(tk.Tk):
     def _scan_worker(self):
         self.queue.put(("status", "Scanning..."))
         try:
+            # IPs discovered live during this scan pass (for monitor diffing).
+            seen_this_pass: Set[str] = set()
+
             # Always seed from ARP cache first.
             for ip, mac in arp_cache().items():
                 host = self._discover_hostname(ip)
-                self.queue.put(("device", (ip, mac, host, "arp-cache")))
+                seen_this_pass.add(ip)
+                self.queue.put(("device", (ip, mac, host, "arp-cache", "")))
 
             nets = self.local_nets[:]
             if not nets:
@@ -702,13 +848,31 @@ class App(tk.Tk):
                     found = scapy_arp_scan(ns.network, iface=ns.iface or None)
                     for ip, mac in found.items():
                         host = self._discover_hostname(ip)
-                        self.queue.put(("device", (ip, mac, host, f"scapy:{ns.source}")))
+                        seen_this_pass.add(ip)
+                        self.queue.put(("device", (ip, mac, host, f"scapy:{ns.source}", "")))
 
                 if self.use_ping.get():
                     live = ping_scan(ns.network, limit=self.max_ping_hosts.get())
                     for ip in live:
                         host = self._discover_hostname(ip)
-                        self.queue.put(("device", (ip, "", host, f"ping:{ns.source}")))
+                        seen_this_pass.add(ip)
+                        self.queue.put(("device", (ip, "", host, f"ping:{ns.source}", "")))
+
+            # Optional TCP port probe across all hosts found this pass.
+            if self.use_port_scan.get() and seen_this_pass:
+                ports = parse_ports(self.port_spec.get())
+                if ports:
+                    self.queue.put(("status", f"Port-scanning {len(seen_this_pass)} hosts..."))
+                    for ip in sorted(seen_this_pass, key=sort_ip):
+                        opened = scan_ports(ip, ports)
+                        if opened:
+                            ports_str = ",".join(str(p) for p in opened)
+                            d = self.store.get(ip)
+                            self.queue.put((
+                                "device",
+                                (ip, d.mac if d else "", d.hostname if d else "",
+                                 d.sources if d else "ports", ports_str),
+                            ))
 
             # Fill in hostnames for everything we have.
             if self.use_reverse_dns.get():
@@ -718,13 +882,42 @@ class App(tk.Tk):
                     if host:
                         d = self.store.get(ip)
                         if d:
-                            self.queue.put(("device", (ip, d.mac, host, d.sources)))
+                            self.queue.put(("device", (ip, d.mac, host, d.sources, d.open_ports)))
+
+            # Continuous-monitor diff: flag hosts that appeared or vanished
+            # relative to the previous completed pass.
+            if self.monitor_on.get():
+                self._emit_monitor_changes(seen_this_pass)
+            self.known_alive = set(seen_this_pass)
 
             self.queue.put(("refresh", None))
             self.queue.put(("status", f"Scan done: {len(self.store.snapshot())} devices"))
             self.queue.put(("log", f"last scan {time.strftime('%H:%M:%S')}"))
         except Exception as e:
             self.queue.put(("status", f"Scan error: {e}"))
+
+    def _emit_monitor_changes(self, seen_this_pass: Set[str]):
+        """Compare this pass against the last and log NEW / GONE hosts."""
+        if self.first_monitor_pass:
+            # First pass establishes a baseline; everything is "known".
+            self.first_monitor_pass = False
+            self.queue.put(("event", f"monitor baseline: {len(seen_this_pass)} hosts"))
+            return
+
+        new_hosts = seen_this_pass - self.known_alive
+        gone_hosts = self.known_alive - seen_this_pass
+
+        for ip in sorted(new_hosts, key=sort_ip):
+            d = self.store.get(ip)
+            label = (d.hostname or d.vendor or d.mac) if d else ""
+            extra = f" ({label})" if label else ""
+            self.queue.put(("event", f"NEW   {ip}{extra}"))
+
+        for ip in sorted(gone_hosts, key=sort_ip):
+            d = self.store.get(ip)
+            label = (d.hostname or d.vendor or d.mac) if d else ""
+            extra = f" ({label})" if label else ""
+            self.queue.put(("event", f"GONE  {ip}{extra}"))
 
     def _schedule_auto_scan(self):
         if self.auto_scan_job is not None:
@@ -764,7 +957,7 @@ class App(tk.Tk):
 
     def _passive_emit(self, ip: str, mac: str, source: str):
         host = self._discover_hostname(ip)
-        self.queue.put(("device", (ip, mac, host, source)))
+        self.queue.put(("device", (ip, mac, host, source, "")))
 
     def stop_all(self):
         self.auto_scan_on.set(False)
@@ -783,7 +976,7 @@ class App(tk.Tk):
             for dev in self.store.snapshot():
                 host = self._discover_hostname(dev.ip)
                 if host:
-                    self.queue.put(("device", (dev.ip, dev.mac, host, dev.sources)))
+                    self.queue.put(("device", (dev.ip, dev.mac, host, dev.sources, dev.open_ports)))
             self.queue.put(("refresh", None))
             self.queue.put(("status", "Hostname refresh done"))
 
@@ -803,18 +996,59 @@ class App(tk.Tk):
             devices = self.store.snapshot()
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f, delimiter=";")
-                w.writerow(["IP Address", "MAC Address", "Hostname", "Sources", "First Seen", "Last Seen", "Alive"])
+                w.writerow(["IP Address", "MAC Address", "Vendor", "Hostname", "Open Ports",
+                            "Sources", "First Seen", "Last Seen", "Alive"])
                 for d in devices:
                     w.writerow([
                         d.ip,
                         d.mac,
+                        d.vendor,
                         d.hostname,
+                        d.open_ports,
                         d.sources,
                         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d.first_seen)) if d.first_seen else "",
                         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d.last_seen)) if d.last_seen else "",
                         "yes" if d.alive else "stale",
                     ])
             messagebox.showinfo("Export complete", f"Saved {len(devices)} devices to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
+    def export_json(self):
+        path = filedialog.asksaveasfilename(
+            title="Save JSON",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile="devices.json",
+        )
+        if not path:
+            return
+
+        try:
+            devices = self.store.snapshot()
+            records = []
+            for d in devices:
+                records.append({
+                    "ip": d.ip,
+                    "mac": d.mac,
+                    "vendor": d.vendor,
+                    "hostname": d.hostname,
+                    "open_ports": [int(p) for p in d.open_ports.split(",") if p.strip().isdigit()],
+                    "sources": d.sources,
+                    "first_seen": (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(d.first_seen))
+                                   if d.first_seen else None),
+                    "last_seen": (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(d.last_seen))
+                                  if d.last_seen else None),
+                    "alive": bool(d.alive),
+                })
+            payload = {
+                "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "count": len(records),
+                "devices": records,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            messagebox.showinfo("Export complete", f"Saved {len(records)} devices to:\n{path}")
         except Exception as e:
             messagebox.showerror("Export failed", str(e))
 
