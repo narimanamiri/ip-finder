@@ -1,9 +1,20 @@
+# Python
 __pycache__/
 *.pyc
+
+# Virtual environments
 .venv/
+venv/
+
+# PyInstaller build artifacts
 build/
 dist/
 *.spec
 *.exe
+
+# Logs
+*.log
+
+# Scan outputs
 live.txt
 devices.csv
