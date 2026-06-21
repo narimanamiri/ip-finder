@@ -1,7 +1,31 @@
+#!/usr/bin/env python3
+"""
+finder.py -- aggressive cross-platform LAN/WAN device discovery aggregator.
+
+Combines every locally available discovery method and merges the results into a
+single per-IP device table (IP, MAC, vendor, hostname, sources), then exports
+CSV. Methods used when available:
+
+  * the OS ARP / neighbor cache (seeded first)
+  * a Scapy ARP scan on directly attached interfaces (optional, needs pcap)
+  * external tools auto-detected on PATH: nmap (-sn), fping, arp-scan, nbtscan
+  * a threaded ICMP ping sweep (fallback that always works)
+  * reverse-DNS resolution of everything found
+
+Targets are the local NIC subnets and OS routes; ``--private`` adds a bounded
+set of common RFC-1918 /24s. MAC addresses are mapped to vendors offline via
+oui_lookup. Scapy/arp-scan need Administrator (Windows) or root (Linux/macOS).
+
+Note: the Scapy ARP path uses pcap (Npcap/libpcap). On a host with a broken
+pcap driver, run with ``--no-scapy`` (the ping/nmap paths do not need pcap).
+
+Usage:
+    python finder.py --out devices.csv
+    python finder.py --private --no-scapy --max-ping-hosts 1024
+"""
 import argparse
 import csv
 import ipaddress
-import os
 import platform
 import re
 import shutil
@@ -13,8 +37,40 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import psutil
 
+def _import_scapy():
+    """Import Scapy while silencing its noisy pcap-service probe.
+
+    On import Scapy logs a WARNING and even shells out to the OS to probe/start
+    the pcap service, leaking text to stderr when pcap is unavailable. Neither
+    affects this tool (the ARP path degrades to the ping sweep), so we suppress
+    that one-time noise by muting the logger and redirecting stderr just for the
+    duration of the import.
+    """
+    import logging
+    import os as _os
+    logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+    saved_fd = devnull_fd = None
+    try:
+        saved_fd = _os.dup(2)
+        devnull_fd = _os.open(_os.devnull, _os.O_WRONLY)
+        _os.dup2(devnull_fd, 2)
+    except Exception:
+        saved_fd = None
+    try:
+        from scapy.all import ARP, Ether, srp, conf  # noqa: F401
+        return ARP, Ether, srp, conf
+    finally:
+        if saved_fd is not None:
+            try:
+                _os.dup2(saved_fd, 2)
+            finally:
+                _os.close(saved_fd)
+        if devnull_fd is not None:
+            _os.close(devnull_fd)
+
+
 try:
-    from scapy.all import ARP, Ether, srp, conf
+    ARP, Ether, srp, conf = _import_scapy()
     SCAPY_AVAILABLE = True
 except Exception:
     SCAPY_AVAILABLE = False

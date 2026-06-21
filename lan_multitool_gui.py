@@ -41,8 +41,38 @@ try:
 except Exception:
     psutil = None
 
+def _import_scapy():
+    """Import Scapy while silencing its noisy import-time pcap-service probe.
+
+    Scapy logs a WARNING and shells out to the OS to probe/start the pcap
+    service on import, leaking text to stderr when pcap is unavailable. The
+    active/passive scapy paths degrade gracefully without pcap, so we mute the
+    logger and redirect stderr only for the duration of the import.
+    """
+    import logging
+    logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+    saved_fd = devnull_fd = None
+    try:
+        saved_fd = os.dup(2)
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull_fd, 2)
+    except Exception:
+        saved_fd = None
+    try:
+        from scapy.all import ARP, Ether, IP, conf, get_if_hwaddr, sniff, srp  # noqa: F401
+        return ARP, Ether, IP, conf, get_if_hwaddr, sniff, srp
+    finally:
+        if saved_fd is not None:
+            try:
+                os.dup2(saved_fd, 2)
+            finally:
+                os.close(saved_fd)
+        if devnull_fd is not None:
+            os.close(devnull_fd)
+
+
 try:
-    from scapy.all import ARP, Ether, IP, conf, get_if_hwaddr, sniff, srp
+    ARP, Ether, IP, conf, get_if_hwaddr, sniff, srp = _import_scapy()
     SCAPY_AVAILABLE = True
 except Exception:
     SCAPY_AVAILABLE = False
@@ -731,6 +761,10 @@ class App(tk.Tk):
         self.queue.put(("log", text))
 
     def _process_queue(self):
+        # Coalesce tree rebuilds: a single scan can enqueue dozens of device
+        # updates per tick, and rebuilding the whole Treeview on each one is
+        # O(n^2). Track a dirty flag and refresh at most once per drain.
+        needs_refresh = False
         try:
             while True:
                 kind, payload = self.queue.get_nowait()
@@ -740,20 +774,22 @@ class App(tk.Tk):
                         ip, mac=mac, hostname=hostname, source=source, open_ports=open_ports
                     )
                     if created or changed:
-                        self._refresh_tree()
+                        needs_refresh = True
                 elif kind == "log":
                     self.last_scan_text.set(str(payload))
                 elif kind == "event":
                     self._append_event(str(payload))
                 elif kind == "refresh":
-                    self._refresh_tree()
+                    needs_refresh = True
                 elif kind == "status":
                     self._set_status(str(payload))
                 elif kind == "nets":
                     self.local_nets = payload
-                    self._refresh_tree()
+                    needs_refresh = True
         except queue.Empty:
             pass
+        if needs_refresh:
+            self._refresh_tree()
         self.after(120, self._process_queue)
 
     def _expire_loop(self):

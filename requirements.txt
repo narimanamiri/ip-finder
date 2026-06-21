@@ -1,0 +1,9 @@
+# Runtime dependencies for the ip-finder toolkit.
+#
+# scannet-fastV2.py uses only the Python standard library and needs none of
+# these. The GUI needs Tkinter, which ships with most CPython installs.
+
+psutil>=5.9          # local interface enumeration (finder, scan-devices, scannet-fast, GUI)
+scapy>=2.5           # required by passive-finder.py; optional ARP path elsewhere
+
+# Build-time only (executables): pip install pyinstaller

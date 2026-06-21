@@ -1,3 +1,21 @@
+#!/usr/bin/env python3
+"""
+passive-finder.py -- passive (zero-probe) direct-link device discovery.
+
+Sniffs the directly attached network with Scapy and reports hosts as they
+reveal themselves through ARP, DHCP and IPv4 traffic -- without sending a single
+packet. Useful when active scanning is undesirable (quiet/forensic discovery)
+or when ICMP is firewalled. New or changed (MAC, IP, protocol) hosts are printed
+as events; the local interface's own MAC/IP are filtered out.
+
+Requires Scapy and a working pcap stack (Npcap on Windows, libpcap on
+Linux/macOS) plus Administrator/root privileges. Pick the interface with
+``--iface``.
+
+Usage:
+    sudo python passive-finder.py --iface eth0
+    python passive-finder.py --iface Ethernet --timeout 60
+"""
 import argparse
 import queue
 import time
@@ -5,7 +23,7 @@ import threading
 from dataclasses import dataclass
 from typing import Dict, Set, Tuple
 
-from scapy.all import ARP, BOOTP, DHCP, Ether, IP, conf, get_if_addr, get_if_hwaddr, sniff
+from scapy.all import ARP, DHCP, Ether, IP, conf, get_if_addr, get_if_hwaddr, sniff
 
 
 @dataclass
